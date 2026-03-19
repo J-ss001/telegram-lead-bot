@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import asyncio
 import psycopg2
 from datetime import datetime
@@ -35,7 +34,8 @@ def get_connection(retries=3):
             print(f"[ERROR] DB connection attempt {attempt}/{retries} failed: {e}")
             if attempt == retries:
                 raise RuntimeError(f"Could not connect to database after {retries} attempts.")
-            asyncio.sleep(1)
+            import time
+            time.sleep(1)
 
 # Initialize database tables
 def init_db():
@@ -109,7 +109,7 @@ def extract_lead_info(text):
         lead['company'] = company_match.group(1).strip()
     
     # Look for name patterns
-    name_match = re.search(r"(?:name|i'm|i am)[:\s]+([A-Za-z\s]+?)(?:[,\.]|$)", text, re.IGNORECASE)
+    name_match = re.search(r"(?:name|i'm|i am|i'm|im)[:\s]+([A-Za-z\s]+?)(?:[,\.]|$)", text, re.IGNORECASE)
     if name_match:
         lead['name'] = name_match.group(1).strip()
     
@@ -129,7 +129,7 @@ def score_lead(lead_info):
     """Use Claude to score lead quality 1-10"""
     try:
         prompt = f"""Rate this lead on a scale of 1-10 based on how likely they are to be a qualified buyer.
-        
+
 Lead Information:
 - Name: {lead_info.get('name', 'Unknown')}
 - Email: {lead_info.get('email', 'Not provided')}
@@ -149,9 +149,12 @@ Respond with ONLY a number between 1-10."""
         
         # Extract score from response
         score_text = response.content[0].text.strip()
-        score = int(re.search(r'\d+', score_text).group())
-        score = max(1, min(10, score))  # Clamp to 1-10
-        return score
+        score_match = re.search(r'\d+', score_text)
+        if score_match:
+            score = int(score_match.group())
+            score = max(1, min(10, score))  # Clamp to 1-10
+            return score
+        return 5
     
     except Exception as e:
         print(f"[ERROR] Claude scoring failed: {e}")
@@ -247,17 +250,17 @@ def export_leads(user_id):
         leads = cursor.fetchall()
         
         if not leads:
-            return "No leads found"
+            return None
         
         # Format as CSV
         csv = "name,email,phone,company,interest,score\n"
         for lead in leads:
-            csv += f'"{lead[0]}","{lead[1]}","{lead[2]}","{lead[3]}","{lead[4]}",{lead[5]}\n'
+            csv += f'"{lead[0] or ""}","{lead[1] or ""}","{lead[2] or ""}","{lead[3] or ""}","{lead[4] or ""}",{lead[5]}\n'
         
         return csv
     except Exception as e:
         print(f"[ERROR] Failed to export leads: {e}")
-        return "Export failed"
+        return None
     finally:
         cursor.close()
         conn.close()
@@ -311,7 +314,7 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     csv_data = export_leads(user_id)
     
-    if csv_data == "No leads found":
+    if csv_data is None:
         await update.message.reply_text("❌ You have no leads to export yet")
         return
     
