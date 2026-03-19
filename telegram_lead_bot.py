@@ -104,12 +104,12 @@ def extract_lead_info(text):
         lead['phone'] = phone_match.group()
     
     # Look for company patterns
-    company_match = re.search(r'(?:company|corp|co|ltd|inc)[:\s]+([A-Za-z\s&]+?)(?:[,\.]|$)', text, re.IGNORECASE)
+    company_match = re.search(r'(?:company|corp|co|ltd|inc|designer|graphic|saas)[:\s]+([A-Za-z\s&]+?)(?:[,\.]|$)', text, re.IGNORECASE)
     if company_match:
         lead['company'] = company_match.group(1).strip()
     
     # Look for name patterns
-    name_match = re.search(r"(?:name|i'm|i am|i'm|im)[:\s]+([A-Za-z\s]+?)(?:[,\.]|$)", text, re.IGNORECASE)
+    name_match = re.search(r"(?:name|i'm|i am|im|hi)[:\s]+([A-Za-z\s]+?)(?:[,\.]|$)", text, re.IGNORECASE)
     if name_match:
         lead['name'] = name_match.group(1).strip()
     
@@ -129,7 +129,7 @@ def score_lead(lead_info):
     """Use Claude to score lead quality 1-10"""
     try:
         prompt = f"""Rate this lead on a scale of 1-10 based on how likely they are to be a qualified buyer.
-
+        
 Lead Information:
 - Name: {lead_info.get('name', 'Unknown')}
 - Email: {lead_info.get('email', 'Not provided')}
@@ -137,11 +137,11 @@ Lead Information:
 - Company: {lead_info.get('company', 'Not provided')}
 - Interest: {lead_info.get('interest', 'Not provided')}
 
-Respond with ONLY a number between 1-10."""
+Only respond with a single number from 1-10. Nothing else."""
         
         response = client.messages.create(
             model="claude-opus-4-1-20250805",
-            max_tokens=10,
+            max_tokens=5,
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -154,11 +154,11 @@ Respond with ONLY a number between 1-10."""
             score = int(score_match.group())
             score = max(1, min(10, score))  # Clamp to 1-10
             return score
-        return 5
+        return 6  # Default score if Claude doesn't respond with number
     
     except Exception as e:
         print(f"[ERROR] Claude scoring failed: {e}")
-        return 5  # Default score
+        return 6  # Default score - more lenient
 
 # Store lead in database
 def store_lead(user_id, lead_info, score):
@@ -301,8 +301,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     message = f"""📊 Your Lead Statistics
 
-Total leads: {stats_data['total_leads']}
-Average score: {stats_data['avg_score']}/10
+Total leads captured: {stats_data['total_leads']}
+Average lead score: {stats_data['avg_score']} / 10
 Today's leads: {stats_data['today_leads']}
 
 Upgrade to Pro to get unlimited leads and features!"""
@@ -370,10 +370,13 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         score = score_lead(lead_info)
         print(f"[INFO] Lead scored: {score}/10")
         
-        # Only store if score >= 5 (quality filter)
-        if score >= 5:
+        # Store if score >= 3 (more lenient for testing)
+        if score >= 3:
             user_id = update.effective_user.id
             store_lead(user_id, lead_info, score)
+            print(f"[INFO] Lead stored (score: {score})")
+        else:
+            print(f"[INFO] Lead skipped (score too low: {score})")
 
 def main():
     """Main function - initialize and run bot"""
