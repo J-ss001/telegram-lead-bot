@@ -104,12 +104,12 @@ def extract_lead_info(text):
         lead['phone'] = phone_match.group()
     
     # Look for company patterns
-    company_match = re.search(r'(?:company|corp|co|ltd|inc|designer|graphic|saas)[:\s]+([A-Za-z\s&]+?)(?:[,\.]|$)', text, re.IGNORECASE)
+    company_match = re.search(r'(?:company|corp|co|ltd|inc|designer|graphic|saas|agency|business)[:\s]+([A-Za-z\s&]+?)(?:[,\.]|$)', text, re.IGNORECASE)
     if company_match:
         lead['company'] = company_match.group(1).strip()
     
     # Look for name patterns
-    name_match = re.search(r"(?:name|i'm|i am|im|hi)[:\s]+([A-Za-z\s]+?)(?:[,\.]|$)", text, re.IGNORECASE)
+    name_match = re.search(r"(?:name|i'm|i am|im|hi|i'm)[:\s]+([A-Za-z\s]+?)(?:[,\.]|$)", text, re.IGNORECASE)
     if name_match:
         lead['name'] = name_match.group(1).strip()
     
@@ -124,12 +124,14 @@ def extract_lead_info(text):
     
     return None
 
-# Score lead with Claude AI
+# Score lead with Claude AI (with error handling)
 def score_lead(lead_info):
     """Use Claude to score lead quality 1-10"""
     try:
-        prompt = f"""Rate this lead on a scale of 1-10 based on how likely they are to be a qualified buyer.
+        print(f"[DEBUG] Attempting to score lead: {lead_info}")
         
+        prompt = f"""Rate this lead on a scale of 1-10 based on how likely they are to be a qualified buyer.
+
 Lead Information:
 - Name: {lead_info.get('name', 'Unknown')}
 - Email: {lead_info.get('email', 'Not provided')}
@@ -137,7 +139,7 @@ Lead Information:
 - Company: {lead_info.get('company', 'Not provided')}
 - Interest: {lead_info.get('interest', 'Not provided')}
 
-Only respond with a single number from 1-10. Nothing else."""
+Respond with ONLY a single number from 1-10."""
         
         response = client.messages.create(
             model="claude-opus-4-1-20250805",
@@ -147,18 +149,24 @@ Only respond with a single number from 1-10. Nothing else."""
             ]
         )
         
+        print(f"[DEBUG] Claude response: {response.content[0].text}")
+        
         # Extract score from response
         score_text = response.content[0].text.strip()
         score_match = re.search(r'\d+', score_text)
         if score_match:
             score = int(score_match.group())
             score = max(1, min(10, score))  # Clamp to 1-10
+            print(f"[DEBUG] Extracted score: {score}")
             return score
-        return 6  # Default score if Claude doesn't respond with number
+        
+        print(f"[DEBUG] Could not extract score from: {score_text}")
+        return 7  # Default score
     
     except Exception as e:
         print(f"[ERROR] Claude scoring failed: {e}")
-        return 6  # Default score - more lenient
+        print(f"[ERROR] Full error: {type(e).__name__}: {str(e)}")
+        return 7  # Default score
 
 # Store lead in database
 def store_lead(user_id, lead_info, score):
@@ -167,6 +175,8 @@ def store_lead(user_id, lead_info, score):
     cursor = conn.cursor()
     
     try:
+        print(f"[DEBUG] Storing lead for user {user_id}: {lead_info}")
+        
         # Ensure user exists
         cursor.execute("""
             INSERT INTO users (telegram_id) VALUES (%s)
@@ -188,7 +198,7 @@ def store_lead(user_id, lead_info, score):
         ))
         
         conn.commit()
-        print(f"[INFO] Lead stored for user {user_id}: {lead_info.get('email', 'No email')} (Score: {score})")
+        print(f"[INFO] ✅ Lead stored successfully for user {user_id}: {lead_info.get('email', 'No email')} (Score: {score})")
     except Exception as e:
         print(f"[ERROR] Failed to store lead: {e}")
         conn.rollback()
@@ -212,6 +222,8 @@ def get_user_stats(user_id):
         result = cursor.fetchone()
         total = result[0] if result[0] else 0
         avg_score = round(result[1], 1) if result[1] else 0
+        
+        print(f"[DEBUG] User {user_id} stats: total={total}, avg_score={avg_score}")
         
         # Count today's leads
         cursor.execute("""
@@ -269,6 +281,7 @@ def export_leads(user_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user_id = update.effective_user.id
+    print(f"[DEBUG] /start command from user {user_id}")
     
     # Register user
     conn = get_connection()
@@ -281,22 +294,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.close()
     conn.close()
     
-    message = """Welcome! 🎉 I'm the Telegram Lead Bot.
+    message = """🎉 Welcome to LeadBot!
 
-I automatically extract and score leads from this group.
+Add me to your Telegram group and I will automatically:
+• Extract potential leads from every message
+• Score each lead 1-10 using AI
+• Store high-quality leads (score ≥ 5) for you
 
 Commands:
-/stats - Show your lead statistics
-/export - Download your leads as CSV
-/help - Show all commands
-
-Just add me to a group and I'll start extracting leads!"""
+/stats – View your lead statistics
+/export – Download leads as CSV
+/help – Show all commands"""
     
     await update.message.reply_text(message)
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /stats command"""
     user_id = update.effective_user.id
+    print(f"[DEBUG] /stats command from user {user_id}")
+    
     stats_data = get_user_stats(user_id)
     
     message = f"""📊 Your Lead Statistics
@@ -327,7 +343,7 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
-    message = """🤖 Telegram Lead Bot Commands
+    message = """🤖 LeadBot Commands
 
 /start - Welcome message
 /stats - Show your lead statistics  
@@ -353,33 +369,40 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     """Handle messages in groups - extract leads"""
     # Only process messages in groups
     if update.message.chat.type not in ['group', 'supergroup']:
+        print(f"[DEBUG] Ignoring non-group message: {update.message.chat.type}")
         return
     
     # Get message text
     text = update.message.text
     if not text:
+        print(f"[DEBUG] Message has no text")
         return
+    
+    print(f"[DEBUG] Processing group message: {text[:100]}")
     
     # Extract lead information
     lead_info = extract_lead_info(text)
     
     if lead_info:
-        print(f"[INFO] Potential lead detected: {lead_info}")
+        print(f"[INFO] ✅ Lead detected: {lead_info}")
         
         # Score the lead
         score = score_lead(lead_info)
-        print(f"[INFO] Lead scored: {score}/10")
+        print(f"[DEBUG] Lead scored: {score}/10")
         
-        # Store if score >= 3 (more lenient for testing)
+        # Store if score >= 3
         if score >= 3:
             user_id = update.effective_user.id
             store_lead(user_id, lead_info, score)
-            print(f"[INFO] Lead stored (score: {score})")
+            print(f"[INFO] Lead will be stored")
         else:
-            print(f"[INFO] Lead skipped (score too low: {score})")
+            print(f"[DEBUG] Lead score too low ({score}), not storing")
+    else:
+        print(f"[DEBUG] No lead info extracted from message")
 
 def main():
     """Main function - initialize and run bot"""
+    print("[INFO] Starting LeadBot...")
     print("[INFO] Initialising database...")
     init_db()
     
