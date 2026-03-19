@@ -1,63 +1,43 @@
+cat > /home/claude/telegram_lead_bot_simple.py << 'EOF'
 import os
 import re
-import asyncio
 import psycopg2
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from anthropic import Anthropic
 
-# Environment variables
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Validate environment variables
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN not set")
-if not CLAUDE_API_KEY:
-    raise ValueError("CLAUDE_API_KEY not set")
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL not set")
+if not TELEGRAM_BOT_TOKEN or not CLAUDE_API_KEY or not DATABASE_URL:
+    raise ValueError("Missing environment variables")
 
-# Initialize Claude client
 client = Anthropic()
 
-# Database connection with retries
-def get_connection(retries=3):
-    for attempt in range(1, retries + 1):
-        try:
-            conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
-            print(f"[INFO] Database connection successful (attempt {attempt})")
-            return conn
-        except psycopg2.OperationalError as e:
-            print(f"[ERROR] DB connection attempt {attempt}/{retries} failed: {e}")
-            if attempt == retries:
-                raise RuntimeError(f"Could not connect to database after {retries} attempts.")
-            import time
-            time.sleep(1)
+def get_connection():
+    try:
+        return psycopg2.connect(DATABASE_URL, connect_timeout=5)
+    except Exception as e:
+        print(f"[ERROR] DB connection failed: {e}")
+        raise
 
-# Initialize database tables
 def init_db():
     print("[INFO] Initialising database...")
     conn = get_connection()
     cursor = conn.cursor()
-    
     try:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id BIGINT PRIMARY KEY,
-                username VARCHAR(255),
-                subscription_status VARCHAR(20) DEFAULT 'free',
-                subscription_start_date TIMESTAMP DEFAULT NOW(),
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS leads (
                 id SERIAL PRIMARY KEY,
-                user_telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                user_telegram_id BIGINT REFERENCES users(telegram_id),
                 name VARCHAR(255),
                 phone VARCHAR(20),
                 email VARCHAR(255),
@@ -67,360 +47,288 @@ def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_leads_user ON leads(user_telegram_id)
-        """)
-        
         conn.commit()
-        print("[INFO] Database tables verified / created.")
-    except Exception as e:
-        print(f"[ERROR] Database initialization failed: {e}")
-        conn.rollback()
-        raise
+        print("[INFO] Database ready")
     finally:
         cursor.close()
         conn.close()
 
-# Extract lead information from message
-def extract_lead_info(text):
-    """Extract name, email, phone, company, interest from message text"""
-    lead = {
-        'name': None,
-        'email': None,
-        'phone': None,
-        'company': None,
-        'interest': None
-    }
+def extract_lead(text):
+    """Extract lead info from text"""
+    lead = {'name': None, 'email': None, 'phone': None, 'company': None, 'interest': None}
     
-    # Email pattern
-    email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
-    if email_match:
-        lead['email'] = email_match.group()
+    email = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
+    if email:
+        lead['email'] = email.group()
     
-    # Phone pattern (handles +27, 0, etc)
-    phone_match = re.search(r'(\+?\d{1,3}[-.\s]?\d{1,14})', text)
-    if phone_match:
-        lead['phone'] = phone_match.group()
+    phone = re.search(r'\+?\d{1,3}[\d\s\-\.]{7,}', text)
+    if phone:
+        lead['phone'] = phone.group()
     
-    # Look for company patterns
-    company_match = re.search(r'(?:company|corp|co|ltd|inc|designer|graphic|saas|agency|business)[:\s]+([A-Za-z\s&]+?)(?:[,\.]|$)', text, re.IGNORECASE)
-    if company_match:
-        lead['company'] = company_match.group(1).strip()
-    
-    # Look for name patterns
-    name_match = re.search(r"(?:name|i'm|i am|im|hi|i'm)[:\s]+([A-Za-z\s]+?)(?:[,\.]|$)", text, re.IGNORECASE)
-    if name_match:
-        lead['name'] = name_match.group(1).strip()
-    
-    # Look for interest/looking for patterns
-    interest_match = re.search(r'(?:looking for|interested in|need)[:\s]+([A-Za-z\s&]+?)(?:[,\.]|$)', text, re.IGNORECASE)
-    if interest_match:
-        lead['interest'] = interest_match.group(1).strip()
-    
-    # Check if we extracted meaningful data
-    if lead['email'] or lead['phone'] or lead['name']:
+    # Simple check - if has email or phone, it's a lead
+    if lead['email'] or lead['phone']:
         return lead
-    
     return None
 
-# Score lead with Claude AI (with error handling)
-def score_lead(lead_info):
-    """Use Claude to score lead quality 1-10"""
+def score_lead(lead):
+    """Score with Claude"""
     try:
-        print(f"[DEBUG] Attempting to score lead: {lead_info}")
-        
-        prompt = f"""Rate this lead on a scale of 1-10 based on how likely they are to be a qualified buyer.
-
-Lead Information:
-- Name: {lead_info.get('name', 'Unknown')}
-- Email: {lead_info.get('email', 'Not provided')}
-- Phone: {lead_info.get('phone', 'Not provided')}
-- Company: {lead_info.get('company', 'Not provided')}
-- Interest: {lead_info.get('interest', 'Not provided')}
-
-Respond with ONLY a single number from 1-10."""
-        
         response = client.messages.create(
             model="claude-opus-4-1-20250805",
             max_tokens=5,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
+            messages=[{"role": "user", "content": f"Rate lead {lead} on scale 1-10. Only respond with number."}]
         )
-        
-        print(f"[DEBUG] Claude response: {response.content[0].text}")
-        
-        # Extract score from response
-        score_text = response.content[0].text.strip()
-        score_match = re.search(r'\d+', score_text)
-        if score_match:
-            score = int(score_match.group())
-            score = max(1, min(10, score))  # Clamp to 1-10
-            print(f"[DEBUG] Extracted score: {score}")
-            return score
-        
-        print(f"[DEBUG] Could not extract score from: {score_text}")
-        return 7  # Default score
-    
+        text = response.content[0].text.strip()
+        match = re.search(r'\d', text)
+        return int(match.group()) if match else 7
     except Exception as e:
-        print(f"[ERROR] Claude scoring failed: {e}")
-        print(f"[ERROR] Full error: {type(e).__name__}: {str(e)}")
-        return 7  # Default score
+        print(f"[ERROR] Scoring failed: {e}")
+        return 7
 
-# Store lead in database
-def store_lead(user_id, lead_info, score):
-    """Store extracted lead in database"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        print(f"[DEBUG] Storing lead for user {user_id}: {lead_info}")
-        
-        # Ensure user exists
-        cursor.execute("""
-            INSERT INTO users (telegram_id) VALUES (%s)
-            ON CONFLICT (telegram_id) DO NOTHING
-        """, (user_id,))
-        
-        # Store lead
-        cursor.execute("""
-            INSERT INTO leads (user_telegram_id, name, email, phone, company, interest, score)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            user_id,
-            lead_info.get('name'),
-            lead_info.get('email'),
-            lead_info.get('phone'),
-            lead_info.get('company'),
-            lead_info.get('interest'),
-            score
-        ))
-        
-        conn.commit()
-        print(f"[INFO] ✅ Lead stored successfully for user {user_id}: {lead_info.get('email', 'No email')} (Score: {score})")
-    except Exception as e:
-        print(f"[ERROR] Failed to store lead: {e}")
-        conn.rollback()
-    finally:
-        cursor.close()
-        conn.close()
-
-# Get user statistics
-def get_user_stats(user_id):
-    """Get lead statistics for user"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("""
-            SELECT COUNT(*) as total_leads, AVG(score) as avg_score
-            FROM leads
-            WHERE user_telegram_id = %s
-        """, (user_id,))
-        
-        result = cursor.fetchone()
-        total = result[0] if result[0] else 0
-        avg_score = round(result[1], 1) if result[1] else 0
-        
-        print(f"[DEBUG] User {user_id} stats: total={total}, avg_score={avg_score}")
-        
-        # Count today's leads
-        cursor.execute("""
-            SELECT COUNT(*) FROM leads
-            WHERE user_telegram_id = %s AND DATE(created_at) = CURRENT_DATE
-        """, (user_id,))
-        
-        today_leads = cursor.fetchone()[0]
-        
-        return {
-            'total_leads': total,
-            'avg_score': avg_score,
-            'today_leads': today_leads
-        }
-    except Exception as e:
-        print(f"[ERROR] Failed to get stats: {e}")
-        return {'total_leads': 0, 'avg_score': 0, 'today_leads': 0}
-    finally:
-        cursor.close()
-        conn.close()
-
-# Export leads as CSV
-def export_leads(user_id):
-    """Export user's leads as CSV"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("""
-            SELECT name, email, phone, company, interest, score
-            FROM leads
-            WHERE user_telegram_id = %s
-            ORDER BY created_at DESC
-        """, (user_id,))
-        
-        leads = cursor.fetchall()
-        
-        if not leads:
-            return None
-        
-        # Format as CSV
-        csv = "name,email,phone,company,interest,score\n"
-        for lead in leads:
-            csv += f'"{lead[0] or ""}","{lead[1] or ""}","{lead[2] or ""}","{lead[3] or ""}","{lead[4] or ""}",{lead[5]}\n'
-        
-        return csv
-    except Exception as e:
-        print(f"[ERROR] Failed to export leads: {e}")
-        return None
-    finally:
-        cursor.close()
-        conn.close()
-
-# Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
     user_id = update.effective_user.id
-    print(f"[DEBUG] /start command from user {user_id}")
-    
-    # Register user
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO users (telegram_id) VALUES (%s)
-        ON CONFLICT (telegram_id) DO NOTHING
-    """, (user_id,))
+    cursor.execute("INSERT INTO users (telegram_id) VALUES (%s) ON CONFLICT (telegram_id) DO NOTHING", (user_id,))
     conn.commit()
     cursor.close()
     conn.close()
     
-    message = """🎉 Welcome to LeadBot!
-
-Add me to your Telegram group and I will automatically:
-• Extract potential leads from every message
-• Score each lead 1-10 using AI
-• Store high-quality leads (score ≥ 5) for you
-
-Commands:
-/stats – View your lead statistics
-/export – Download leads as CSV
-/help – Show all commands"""
-    
-    await update.message.reply_text(message)
+    msg = "✅ LeadBot Active!\n\n/stats - View leads\n/export - Download CSV"
+    await update.message.reply_text(msg)
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats command"""
     user_id = update.effective_user.id
-    print(f"[DEBUG] /stats command from user {user_id}")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*), AVG(score) FROM leads WHERE user_telegram_id = %s", (user_id,))
+    total, avg = cursor.fetchone()
+    cursor.close()
+    conn.close()
     
-    stats_data = get_user_stats(user_id)
+    total = total or 0
+    avg = round(avg, 1) if avg else 0
     
-    message = f"""📊 Your Lead Statistics
+    msg = f"📊 Your Leads\n\nTotal: {total}\nAverage Score: {avg}/10"
+    await update.message.reply_text(msg)
 
-Total leads captured: {stats_data['total_leads']}
-Average lead score: {stats_data['avg_score']} / 10
-Today's leads: {stats_data['today_leads']}
-
-Upgrade to Pro to get unlimited leads and features!"""
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process ALL messages in groups"""
+    print(f"[DEBUG] Message received in {update.message.chat.type}")
     
-    await update.message.reply_text(message)
-
-async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /export command"""
-    user_id = update.effective_user.id
-    csv_data = export_leads(user_id)
-    
-    if csv_data is None:
-        await update.message.reply_text("❌ You have no leads to export yet")
-        return
-    
-    # Send as file
-    await update.message.reply_document(
-        document=csv_data.encode(),
-        filename=f"leads_{user_id}_{datetime.now().strftime('%Y%m%d')}.csv",
-        caption="📥 Your extracted leads (CSV format)"
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command"""
-    message = """🤖 LeadBot Commands
-
-/start - Welcome message
-/stats - Show your lead statistics  
-/export - Download leads as CSV
-/help - Show this help message
-
-How it works:
-1. Add me to your group
-2. Post leads in the group (name, email, phone, company)
-3. I automatically extract and score them
-4. Use /stats to see results
-5. Use /export to download CSV
-
-Features:
-✅ Automatic lead extraction
-✅ AI quality scoring (1-10)
-✅ CSV export
-✅ Lead statistics"""
-    
-    await update.message.reply_text(message)
-
-async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle messages in groups - extract leads"""
-    # Only process messages in groups
     if update.message.chat.type not in ['group', 'supergroup']:
-        print(f"[DEBUG] Ignoring non-group message: {update.message.chat.type}")
         return
     
-    # Get message text
     text = update.message.text
     if not text:
-        print(f"[DEBUG] Message has no text")
         return
     
-    print(f"[DEBUG] Processing group message: {text[:100]}")
+    print(f"[DEBUG] Group message: {text[:50]}")
     
-    # Extract lead information
-    lead_info = extract_lead_info(text)
+    lead = extract_lead(text)
+    if not lead:
+        print("[DEBUG] No lead extracted")
+        return
     
-    if lead_info:
-        print(f"[INFO] ✅ Lead detected: {lead_info}")
-        
-        # Score the lead
-        score = score_lead(lead_info)
-        print(f"[DEBUG] Lead scored: {score}/10")
-        
-        # Store if score >= 3
-        if score >= 3:
-            user_id = update.effective_user.id
-            store_lead(user_id, lead_info, score)
-            print(f"[INFO] Lead will be stored")
-        else:
-            print(f"[DEBUG] Lead score too low ({score}), not storing")
-    else:
-        print(f"[DEBUG] No lead info extracted from message")
+    print(f"[INFO] LEAD FOUND: {lead}")
+    
+    score = score_lead(lead)
+    print(f"[INFO] Score: {score}")
+    
+    user_id = update.effective_user.id
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("INSERT INTO users (telegram_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
+    cursor.execute("""
+        INSERT INTO leads (user_telegram_id, email, phone, score)
+        VALUES (%s, %s, %s, %s)
+    """, (user_id, lead['email'], lead['phone'], score))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    print(f"[INFO] ✅ LEAD STORED for user {user_id}")
 
 def main():
-    """Main function - initialize and run bot"""
-    print("[INFO] Starting LeadBot...")
-    print("[INFO] Initialising database...")
+    print("[INFO] Starting bot...")
     init_db()
     
-    print("[INFO] Building Telegram application...")
-    
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Add command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("export", export))
-    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Add message handler for group messages
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_message))
+    print("[INFO] Bot polling...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
+EOF
+cat /home/claude/telegram_lead_bot_simple.py
+Output
+
+import os
+import re
+import psycopg2
+from datetime import datetime
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from anthropic import Anthropic
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if not TELEGRAM_BOT_TOKEN or not CLAUDE_API_KEY or not DATABASE_URL:
+    raise ValueError("Missing environment variables")
+
+client = Anthropic()
+
+def get_connection():
+    try:
+        return psycopg2.connect(DATABASE_URL, connect_timeout=5)
+    except Exception as e:
+        print(f"[ERROR] DB connection failed: {e}")
+        raise
+
+def init_db():
+    print("[INFO] Initialising database...")
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id BIGINT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id SERIAL PRIMARY KEY,
+                user_telegram_id BIGINT REFERENCES users(telegram_id),
+                name VARCHAR(255),
+                phone VARCHAR(20),
+                email VARCHAR(255),
+                company VARCHAR(255),
+                interest TEXT,
+                score INT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+        print("[INFO] Database ready")
+    finally:
+        cursor.close()
+        conn.close()
+
+def extract_lead(text):
+    """Extract lead info from text"""
+    lead = {'name': None, 'email': None, 'phone': None, 'company': None, 'interest': None}
     
-    print("[INFO] Bot started. Polling for updates...")
+    email = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
+    if email:
+        lead['email'] = email.group()
     
+    phone = re.search(r'\+?\d{1,3}[\d\s\-\.]{7,}', text)
+    if phone:
+        lead['phone'] = phone.group()
+    
+    # Simple check - if has email or phone, it's a lead
+    if lead['email'] or lead['phone']:
+        return lead
+    return None
+
+def score_lead(lead):
+    """Score with Claude"""
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-1-20250805",
+            max_tokens=5,
+            messages=[{"role": "user", "content": f"Rate lead {lead} on scale 1-10. Only respond with number."}]
+        )
+        text = response.content[0].text.strip()
+        match = re.search(r'\d', text)
+        return int(match.group()) if match else 7
+    except Exception as e:
+        print(f"[ERROR] Scoring failed: {e}")
+        return 7
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO users (telegram_id) VALUES (%s) ON CONFLICT (telegram_id) DO NOTHING", (user_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    msg = "✅ LeadBot Active!\n\n/stats - View leads\n/export - Download CSV"
+    await update.message.reply_text(msg)
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*), AVG(score) FROM leads WHERE user_telegram_id = %s", (user_id,))
+    total, avg = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    total = total or 0
+    avg = round(avg, 1) if avg else 0
+    
+    msg = f"📊 Your Leads\n\nTotal: {total}\nAverage Score: {avg}/10"
+    await update.message.reply_text(msg)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process ALL messages in groups"""
+    print(f"[DEBUG] Message received in {update.message.chat.type}")
+    
+    if update.message.chat.type not in ['group', 'supergroup']:
+        return
+    
+    text = update.message.text
+    if not text:
+        return
+    
+    print(f"[DEBUG] Group message: {text[:50]}")
+    
+    lead = extract_lead(text)
+    if not lead:
+        print("[DEBUG] No lead extracted")
+        return
+    
+    print(f"[INFO] LEAD FOUND: {lead}")
+    
+    score = score_lead(lead)
+    print(f"[INFO] Score: {score}")
+    
+    user_id = update.effective_user.id
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("INSERT INTO users (telegram_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
+    cursor.execute("""
+        INSERT INTO leads (user_telegram_id, email, phone, score)
+        VALUES (%s, %s, %s, %s)
+    """, (user_id, lead['email'], lead['phone'], score))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    print(f"[INFO] ✅ LEAD STORED for user {user_id}")
+
+def main():
+    print("[INFO] Starting bot...")
+    init_db()
+    
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    print("[INFO] Bot polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
